@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <libgen.h>
 #include <gpiod.h>
+#include "tools-common.h"
 
 #define HOMEPAGE_URL "https://blokas.io/pisound/"
 #define UPDATE_URL   HOMEPAGE_URL "updates/?btnv=%x.%02x&v=%s&sn=%s&id=%s"
@@ -60,8 +61,8 @@ struct gpio_pin_t
 	bool              exported;
 };
 
-struct gpiod_chip *g_chip = NULL;
 struct gpio_pin_t g_pin;
+char *g_chip_path;
 static int g_button_pin = 17;
 static enum PinActivation g_pin_activation = PA_ACTIVE_LOW;
 static bool g_use_default = true;
@@ -861,195 +862,75 @@ static void onHold(unsigned num_presses, timestamp_ms_t time_held)
 	execute_action(A_HOLD, num_presses, time_held);
 }
 
-static struct gpiod_chip *open_rpi_gpiochip()
+/* Request a line as input with edge detection. */
+static struct gpiod_line_request *request_input_line(const char *chip_path,
+						     unsigned int offset,
+						     const char *consumer)
 {
-	static const char *const gpiochip_names[] = {
-		"pinctrl-rp1", "pinctrl-bcm2835", "pinctrl-bcm2711"
-	};
-
-	int i;
+	struct gpiod_request_config *req_cfg = NULL;
+	struct gpiod_line_request *request = NULL;
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
 	struct gpiod_chip *chip;
-	for (i=0; i<sizeof(gpiochip_names)/sizeof(*gpiochip_names); ++i)
-	{
-		chip = gpiod_chip_open_by_label(gpiochip_names[i]);
-		if (chip)
-			return chip;
+	int ret;
+
+	chip = gpiod_chip_open(chip_path);
+	if (!chip)
+		return NULL;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		goto close_chip;
+
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+	gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_BOTH);
+	/* Assume a button connecting the pin to ground, so pull it up... */
+	gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
+	/* ... and provide some debounce. */
+	gpiod_line_settings_set_debounce_period_us(settings, 10000);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg)
+		goto free_settings;
+
+	ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1,
+						  settings);
+	if (ret)
+		goto free_line_config;
+
+	if (consumer) {
+		req_cfg = gpiod_request_config_new();
+		if (!req_cfg)
+			goto free_line_config;
+
+		gpiod_request_config_set_consumer(req_cfg, consumer);
 	}
 
-	// Fall back to searching for gpiochip via a known pin name.
-	struct gpiod_line *l = gpiod_line_find("ID_SD");
-	if (l)
-	{
-		chip = gpiod_line_get_chip(l);
-		return chip;
-	}
+	request = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
 
-	return NULL;
+	gpiod_request_config_free(req_cfg);
+
+free_line_config:
+	gpiod_line_config_free(line_cfg);
+
+free_settings:
+	gpiod_line_settings_free(settings);
+
+close_chip:
+	gpiod_chip_close(chip);
+
+	return request;
 }
 
-static void gpio_pin_close(struct gpio_pin_t *pin)
+static const char *edge_event_type_str(struct gpiod_edge_event *event)
 {
-	if (!pin)
-		return;
-
-	if (pin->fd != -1)
-	{
-		close(pin->fd);
-		pin->fd = -1;
-	}
-
-	if (pin->line)
-	{
-		gpiod_line_release(pin->line);
-		pin->line = NULL;
-	}
-
-	if (pin->exported)
-	{
-		gpio_unexport(pin->offset);
-		pin->exported = false;
-	}
-
-	pin->offset = -1;
-}
-
-static int gpio_pin_open_input(struct gpio_pin_t *pin, int offset, enum edge_e edge, enum pull_e pull, const bool *active_low)
-{
-	struct gpio_pin_t p;
-	p.line = NULL;
-	p.fd = -1;
-	p.exported = false;
-	p.events = 0;
-	p.offset = offset;
-
-	// First attempt access via sysfs gpio class, otherwise, try libgpiod.
-	int err = gpio_export(offset);
-
-	if (err < 0) goto gpiod;
-	else p.exported = (err == 1);
-
-	if (active_low)
-	{
-		err = gpio_set_active_low(offset, *active_low);
-		if (err != 0)
-			goto cleanup;
-	}
-
-	err = gpio_set_edge(offset, edge);
-
-	if (err != 0)
-		goto cleanup;
-
-	p.fd = gpio_open(offset);
-	if (p.fd == -1)
-	{
-		err = errno;
-		goto cleanup;
-	}
-
-	p.events = POLLPRI;
-
-	goto success;
-
-gpiod:
-	if (!g_chip)
-	{
-		fprintf(stderr, "Won't attempt opening with libgpiod as the gpiochip was not found!\n");
-		return ENOENT;
-	}
-
-	p.line = gpiod_chip_get_line(g_chip, offset);
-
-	if (!p.line)
-	{
-		fprintf(stderr, "GPIO %d couldn't be found!\n", offset);
-		err = ENOENT;
-		goto cleanup;
-	}
-
-	const char *consumer = "pisound-btn";
-	int flags = 0;
-	if (active_low)
-		flags |= *active_low ? GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW : 0;
-
-	switch (pull)
-	{
+	switch (gpiod_edge_event_get_event_type(event)) {
+	case GPIOD_EDGE_EVENT_RISING_EDGE:
+		return "Rising";
+	case GPIOD_EDGE_EVENT_FALLING_EDGE:
+		return "Falling";
 	default:
-	case P_NONE:
-		flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_DISABLE;
-		break;
-	case P_UP:
-		flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP;
-		break;
-	case P_DOWN:
-		flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
-		break;
-	}
-
-	switch (edge)
-	{
-	case E_RISING:
-		err = gpiod_line_request_rising_edge_events_flags(p.line, consumer, flags);
-		break;
-	case E_FALLING:
-		err = gpiod_line_request_falling_edge_events_flags(p.line, consumer, flags);
-		break;	
-	case E_BOTH:
-		err = gpiod_line_request_both_edges_events_flags(p.line, consumer, flags);
-		break;
-	case E_NONE:
-		break;
-	}
-
-	if (err == -1)
-	{
-		fprintf(stderr, "%u line request for edge events failed!\n", offset);
-		err = errno;
-		goto cleanup;
-	}
-
-	p.fd = gpiod_line_event_get_fd(p.line);
-	p.events = POLLIN | POLLPRI;
-
-	goto success;
-
-success:
-	memcpy(pin, &p, sizeof(p));
-	return 0;
-
-cleanup:
-	gpio_pin_close(&p);
-	return err;
-}
-
-static int gpio_pin_read(struct gpio_pin_t *pin)
-{
-	if (pin->fd == -1)
-		return -EINVAL;
-	if (pin->line)
-	{
-		struct gpiod_line_event ev;
-		gpiod_line_event_read_fd(pin->fd, &ev);
-		return ev.event_type == GPIOD_LINE_EVENT_RISING_EDGE;
-	}
-	else
-	{
-		char buff[16];
-		memset(buff, 0, sizeof(buff));
-		int n = read(pin->fd, buff, sizeof(buff));
-		if (n == 0)
-		{
-			fprintf(stderr, "Reading pin value returned 0.\n");
-			return -EINVAL;
-		}
-
-		if (lseek(pin->fd, SEEK_SET, 0) == -1)
-		{
-			fprintf(stderr, "Rewinding pin failed. Error %d.\n", errno);
-			return -EINVAL;
-		}
-
-		return strtoul(buff, NULL, 10);
+		return "Unknown";
 	}
 }
 
@@ -1085,14 +966,34 @@ static int run(void)
 		return EINVAL;
 	}
 
-	bool active_low = g_pin_activation == PA_ACTIVE_LOW;
-	int err = gpio_pin_open_input(&g_pin, g_button_pin, E_BOTH, P_UP, g_pin_activation != PA_UNSPECIFIED ? &active_low : NULL);
+	struct gpiod_edge_event_buffer *event_buffer;
+	struct gpiod_line_request *request;
+	struct gpiod_edge_event *event;
+	int i, event_buf_size;
+	struct pollfd pollfd;
 
-	if (err != 0)
-	{
-		fprintf(stderr, "Failed opening pin input! (%d)\n", err);
-		return err;
+	request = request_input_line(g_chip_path, g_button_pin,
+				     "async-watch-button-pin");
+	if (!request) {
+		fprintf(stderr, "failed to request line: %s\n",
+			strerror(errno));
+		return EXIT_FAILURE;
 	}
+
+	/*
+	 * A larger buffer is an optimisation for reading bursts of events from
+	 * the kernel, but that is not necessary in this case, so 1 is fine.
+	 */
+	event_buf_size = 1;
+	event_buffer = gpiod_edge_event_buffer_new(event_buf_size);
+	if (!event_buffer) {
+		fprintf(stderr, "failed to create event buffer: %s\n",
+			strerror(errno));
+		return EXIT_FAILURE;
+	}
+
+	pollfd.fd = gpiod_line_request_get_fd(request);
+	pollfd.events = POLLIN;
 
 	enum
 	{
@@ -1105,7 +1006,6 @@ static int run(void)
 	if (timerfd == -1)
 	{
 		fprintf(stderr, "Creating timer failed. Error %d.\n", errno);
-		gpio_pin_close(&g_pin);
 		return errno;
 	}
 
@@ -1135,12 +1035,20 @@ static int run(void)
 		if (result == 0)
 			continue;
 
-		if (pfd[FD_BUTTON].revents) // Button state changed.
-		{
+		result = gpiod_line_request_read_edge_events(request, event_buffer,
+							  event_buf_size);
+		if (result == -1) {
+			fprintf(stderr, "error reading edge events: %s\n",
+				strerror(errno));
+			return EXIT_FAILURE;
+		}
+
+		for (i = 0; i < result; i++)
+        {
 			timestamp_ms_t timestamp = get_timestamp_ms();
 
-			unsigned long pressed = gpio_pin_read(&g_pin) > 0;
-
+			// unsigned long pressed = gpio_pin_read(&g_pin) > 0;
+			unsigned long pressed = gpiod_edge_event_get_event_type(event) == GPIOD_LINE_EDGE_RISING ? 1 : 0;
 			if (pressed)
 			{
 				button_down = true;
@@ -1197,7 +1105,6 @@ static int run(void)
 	}
 
 	close(timerfd);
-	gpio_pin_close(&g_pin);
 	return 0;
 }
 
@@ -1315,11 +1222,6 @@ static bool read_config_uint(const char *conf, const char *value_name, unsigned 
 	}
 }
 
-static void cleanup(void)
-{
-	gpio_pin_close(&g_pin);
-}
-
 static void sigint_handler(int signum)
 {
 	exit(0);
@@ -1327,7 +1229,6 @@ static void sigint_handler(int signum)
 
 int main(int argc, char **argv, char **envp)
 {
-	atexit(&cleanup);
 	struct sigaction action;
 	memset(&action, 0, sizeof(action));
 	action.sa_handler = &sigint_handler;
@@ -1486,12 +1387,21 @@ int main(int argc, char **argv, char **envp)
 		read_config_uint(g_config_path, CLICK_COUNT_LIMIT_VALUE_NAME, &g_click_count_limit, g_click_count_limit);
 	}
 
-	g_chip = open_rpi_gpiochip();
+    static const char *const gpiochip_labels[] = {"pinctrl-rp1", "pinctrl-bcm2835",
+                                                  "pinctrl-bcm2711"};
+    for (int i = 0; i < 3; ++i) {
+        if (chip_path_lookup(gpiochip_labels[i], &g_chip_path)) {
+            break;
+        } else {
+	        fprintf(stderr, "Won't attempt opening with libgpiod as the gpiochip was not found!\n");
+	        return 1;
+        }        
+    }
 
 	int ret = run();
 
-	if (g_chip)
-		gpiod_chip_close(g_chip);
+	if (g_chip_path)
+		free(g_chip_path);
 
 	return ret;
 }

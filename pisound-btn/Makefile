@@ -31,7 +31,7 @@ INSTALL_DATA?=$(INSTALL) -m 644
 all: pisound-btn
 
 pisound-btn: pisound-btn.c
-	gcc pisound-btn.c -lgpiod -o pisound-btn
+	gcc pisound-btn.c tools-common.c -lgpiod -o pisound-btn
 	strip pisound-btn
 
 test: test.c
