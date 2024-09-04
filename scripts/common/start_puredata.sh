@@ -51,7 +51,7 @@ start_puredata()
 		log "Giving $PURE_DATA_STARTUP_SLEEP seconds for Pure Data to start up before connecting MIDI ports."
 		sleep $PURE_DATA_STARTUP_SLEEP
 
-		READABLE_PORTS=`aconnect -i | egrep -iv "(Through|Pure Data|System)" | egrep -o "[0-9]+:" | egrep -o "[0-9]+"`
+		READABLE_PORTS=`aconnect -i | grep -E -iv "(Through|Pure Data|System)" | grep -E -o "[0-9]+:" | grep -E -o "[0-9]+"`
 		RANGE="0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
 
 		log "Connecting all MIDI ports to and from Pure Data."

@@ -22,7 +22,7 @@ log() {
 	echo `date +"%F.%T"`: $*
 }
 
-PISOUND_MIDI_DEVICE=`amidi -l | grep pisound | egrep -o hw:[0-9]+,[0-9]+`
+PISOUND_MIDI_DEVICE=`amidi -l | grep pisound | grep -E -o hw:[0-9]+,[0-9]+`
 
 if [ -z $PISOUND_MIDI_DEVICE ]; then
 	log "Pisound MIDI device not found!"

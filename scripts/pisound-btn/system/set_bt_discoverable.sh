@@ -38,7 +38,7 @@ TIMEOUT=0
 for btdev in `gdbus introspect --system --dest org.bluez --object-path / --recurse | grep hci | grep -e '/hci[0..9]* ' | awk '/^ *node /{print $2}'`; do
 	log Setting Discoverable prop of $btdev to $1
 	gdbus call --system --dest org.bluez --object-path $btdev --method org.freedesktop.DBus.Properties.Set org.bluez.Adapter1 "Discoverable" "<$1>" > /dev/null;
-	TIMEOUT=`gdbus call --system --dest org.bluez --object-path /org/bluez/hci0 --method org.freedesktop.DBus.Properties.Get org.bluez.Adapter1 "DiscoverableTimeout" | awk '{print $2}' | egrep -o [0-9]*`
+	TIMEOUT=`gdbus call --system --dest org.bluez --object-path /org/bluez/hci0 --method org.freedesktop.DBus.Properties.Get org.bluez.Adapter1 "DiscoverableTimeout" | awk '{print $2}' | grep -E -o [0-9]*`
 done
 
 if [ "$1" = "true" ]; then
