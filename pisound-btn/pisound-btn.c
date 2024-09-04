@@ -52,17 +52,7 @@ enum PinActivation
 	PA_ACTIVE_HIGH = 2
 };
 
-struct gpio_pin_t
-{
-	struct gpiod_line *line;
-	int               fd;
-	int               offset;
-	int               events;
-	bool              exported;
-};
-
-struct gpio_pin_t g_pin;
-char *g_chip_path;
+static char* g_chip_path;
 static int g_button_pin = 17;
 static enum PinActivation g_pin_activation = PA_ACTIVE_LOW;
 static bool g_use_default = true;
@@ -862,6 +852,62 @@ static void onHold(unsigned num_presses, timestamp_ms_t time_held)
 	execute_action(A_HOLD, num_presses, time_held);
 }
 
+static char *find_chip_path()
+{
+	static const char *const gpiochip_names[] = {
+		"pinctrl-rp1", "pinctrl-bcm2835", "pinctrl-bcm2711"
+	};
+
+	char **paths, *path;
+	int num_chips = all_chip_paths(&paths);
+	struct gpiod_chip_info *info;
+	struct gpiod_chip *chip;
+
+	int i;
+
+	for (i = 0; i < num_chips; i++) {
+    	chip = gpiod_chip_open(paths[i]);
+    	if (!chip) {
+    		fprintf(stderr, "failed to open chip: %s\n", strerror(errno));
+    		return NULL;
+    	}
+    
+    	info = gpiod_chip_get_info(chip);
+    	if (!info) {
+    		fprintf(stderr, "failed to read info: %s\n", strerror(errno));
+    		return NULL;
+    	}
+    
+    	for (i=0; i<sizeof(gpiochip_names)/sizeof(*gpiochip_names); ++i)
+    	{
+    		// chip = gpiod_chip_open_by_label(gpiochip_names[i]);
+    		// if (chip)
+    		// 	return chip;
+            if (strcmp(gpiod_chip_info_get_label(info), gpiochip_names[i]) == 0) {
+    	gpiod_chip_info_free(info);
+    	        gpiod_chip_close(chip);
+
+    	        return paths[i];
+            }
+        }
+
+    	gpiod_chip_info_free(info);
+    	gpiod_chip_close(chip);
+    }
+
+    // TODO: reimplement this
+	// Fall back to searching for gpiochip via a known pin name.
+	// struct gpiod_line *l = gpiod_line_find("ID_SD");
+	// if (l)
+	// {
+	// 	chip = gpiod_line_get_chip(l);
+	// 	return chip;
+	// }
+
+	return NULL;
+}
+
+
 /* Request a line as input with edge detection. */
 static struct gpiod_line_request *request_input_line(const char *chip_path,
 						     unsigned int offset,
@@ -970,7 +1016,6 @@ static int run(void)
 	struct gpiod_line_request *request;
 	struct gpiod_edge_event *event;
 	int i, event_buf_size;
-	struct pollfd pollfd;
 
 	request = request_input_line(g_chip_path, g_button_pin,
 				     "async-watch-button-pin");
@@ -992,9 +1037,6 @@ static int run(void)
 		return EXIT_FAILURE;
 	}
 
-	pollfd.fd = gpiod_line_request_get_fd(request);
-	pollfd.events = POLLIN;
-
 	enum
 	{
 		FD_BUTTON = 0,
@@ -1013,8 +1055,8 @@ static int run(void)
 
 	struct pollfd pfd[FD_COUNT];
 
-	pfd[FD_BUTTON].fd = g_pin.fd;
-	pfd[FD_BUTTON].events = g_pin.events;
+	pfd[FD_BUTTON].fd = gpiod_line_request_get_fd(request);
+	pfd[FD_BUTTON].events = POLLIN;
 
 	pfd[FD_TIMER].fd = timerfd;
 	pfd[FD_TIMER].events = POLLIN;
@@ -1029,14 +1071,22 @@ static int run(void)
 	{
 		int result = poll(pfd, FD_COUNT, -1);
 
+        // TODO: why this?
 		if (result == -1)
 			break;
 
 		if (result == 0)
 			continue;
 
+		// if (result == -1) {
+		// 	fprintf(stderr, "error waiting for edge events: %s\n",
+		// 		strerror(errno));
+		// 	return EXIT_FAILURE;
+		// }
+
 		result = gpiod_line_request_read_edge_events(request, event_buffer,
 							  event_buf_size);
+        fprintf(stderr, "the result: %d\n", result);
 		if (result == -1) {
 			fprintf(stderr, "error reading edge events: %s\n",
 				strerror(errno));
@@ -1045,6 +1095,8 @@ static int run(void)
 
 		for (i = 0; i < result; i++)
         {
+			event = gpiod_edge_event_buffer_get_event(event_buffer,i);
+
 			timestamp_ms_t timestamp = get_timestamp_ms();
 
 			// unsigned long pressed = gpio_pin_read(&g_pin) > 0;
@@ -1387,16 +1439,7 @@ int main(int argc, char **argv, char **envp)
 		read_config_uint(g_config_path, CLICK_COUNT_LIMIT_VALUE_NAME, &g_click_count_limit, g_click_count_limit);
 	}
 
-    static const char *const gpiochip_labels[] = {"pinctrl-rp1", "pinctrl-bcm2835",
-                                                  "pinctrl-bcm2711"};
-    for (int i = 0; i < 3; ++i) {
-        if (chip_path_lookup(gpiochip_labels[i], &g_chip_path)) {
-            break;
-        } else {
-	        fprintf(stderr, "Won't attempt opening with libgpiod as the gpiochip was not found!\n");
-	        return 1;
-        }        
-    }
+    g_chip_path = find_chip_path();
 
 	int ret = run();
 
