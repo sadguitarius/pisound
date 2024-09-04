@@ -185,7 +185,8 @@ def is_rpi4_compatible():
     return get_hw_version() != '1.0'
 
 def get_ip():
-    out = subprocess.check_output(['hostname', '-I'])
+    # TODO: shouldn't have to do this, but here we are
+    out = subprocess.check_output(['hostname', '-i'])
     return str(out.decode("utf-8")).strip()
 
 def get_hostname():
