@@ -17,6 +17,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
+#include <dirent.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -32,7 +33,6 @@
 #include <signal.h>
 #include <libgen.h>
 #include <gpiod.h>
-#include "tools-common.h"
 
 #define HOMEPAGE_URL "https://blokas.io/pisound/"
 #define UPDATE_URL   HOMEPAGE_URL "updates/?btnv=%x.%02x&v=%s&sn=%s&id=%s"
@@ -852,6 +852,64 @@ static void onHold(unsigned num_presses, timestamp_ms_t time_held)
 	execute_action(A_HOLD, num_presses, time_held);
 }
 
+static int chip_dir_filter(const struct dirent *entry)
+{
+	struct stat sb;
+	int ret = 0;
+	char *path;
+
+	if (asprintf(&path, "/dev/%s", entry->d_name) < 0)
+		return 0;
+
+	if ((lstat(path, &sb) == 0) && (!S_ISLNK(sb.st_mode)) &&
+	    gpiod_is_gpiochip_device(path))
+		ret = 1;
+
+	free(path);
+
+	return ret;
+}
+
+int all_chip_paths(char ***paths_ptr)
+
+{
+	int i, j, num_chips, ret = 0;
+	struct dirent **entries;
+	char **paths;
+
+    // TODO: should be versionsort but that's not working?
+	num_chips = scandir("/dev/", &entries, chip_dir_filter, alphasort);
+	if (num_chips < 0) {
+		fprintf(stderr, "unable to scan /dev");
+        return 0;
+    }
+
+	paths = calloc(num_chips, sizeof(*paths));
+	if (paths == NULL) {
+		fprintf(stderr, "out of memory");
+        return 0;
+    }
+
+	for (i = 0; i < num_chips; i++) {
+		if (asprintf(&paths[i], "/dev/%s", entries[i]->d_name) < 0) {
+			for (j = 0; j < i; j++)
+				free(paths[j]);
+
+			free(paths);
+			return 0;
+		}
+	}
+
+	*paths_ptr = paths;
+	ret = num_chips;
+
+	for (i = 0; i < num_chips; i++)
+		free(entries[i]);
+
+	free(entries);
+	return ret;
+}
+
 static char *find_chip_path()
 {
 	static const char *const gpiochip_names[] = {
@@ -1086,7 +1144,6 @@ static int run(void)
 
 		result = gpiod_line_request_read_edge_events(request, event_buffer,
 							  event_buf_size);
-        fprintf(stderr, "the result: %d\n", result);
 		if (result == -1) {
 			fprintf(stderr, "error reading edge events: %s\n",
 				strerror(errno));
